@@ -1,149 +1,102 @@
-provider "aws" {
-  region = "us-east-1" # Change as needed
-}
+import os
+import json
+import urllib.request
+import boto3
+from datetime import datetime, timedelta, timezone
 
-# SNS Topic
-resource "aws_sns_topic" "nba_game_alerts" {
-  name = "nba_game_alerts"
-}
-
-# IAM Role for Lambda
-resource "aws_iam_role" "lambda_role" {
-  name = "nba_lambda_role"
-
-  assume_role_policy = <<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Action": "sts:AssumeRole",
-      "Principal": {
-        "Service": "lambda.amazonaws.com"
-      },
-      "Effect": "Allow",
-      "Sid": ""
-    }
-  ]
-}
-EOF
-}
-
-# IAM Policy for Lambda to publish to SNS
-resource "aws_iam_policy" "sns_publish_policy" {
-  name        = "sns_publish_policy"
-  description = "Policy to allow Lambda to publish to SNS"
-
-  policy = <<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": "sns:Publish",
-      "Resource": "${aws_sns_topic.nba_game_alerts.arn}"
-    }
-  ]
-}
-EOF
-}
-
-# Attach IAM Policy for Lambda to publish to SNS to IAM Role
-resource "aws_iam_role_policy_attachment" "attach_sns_publish" {
-  role       = aws_iam_role.lambda_role.name
-  policy_arn = aws_iam_policy.sns_publish_policy.arn
-}
+def format_game_data(game):
+    status = game.get("Status", "Unknown")
+    away_team = game.get("AwayTeam", "Unknown")
+    home_team = game.get("HomeTeam", "Unknown")
+    final_score = f"{game.get('AwayTeamScore', 'N/A')}-{game.get('HomeTeamScore', 'N/A')}"
+    start_time = game.get("DateTime", "Unknown")
+    channel = game.get("Channel", "Unknown")
+    
+    # Format quarters
+    quarters = game.get("Quarters", [])
+    quarter_scores = ', '.join([f"Q{q['Number']}: {q.get('AwayScore', 'N/A')}-{q.get('HomeScore', 'N/A')}" for q in quarters])
+    
+    if status == "Final":
+        return (
+            f"Game Status: {status}\n"
+            f"{away_team} vs {home_team}\n"
+            f"Final Score: {final_score}\n"
+            f"Start Time: {start_time}\n"
+            f"Channel: {channel}\n"
+            f"Quarter Scores: {quarter_scores}\n"
+        )
+    elif status == "InProgress":
+        last_play = game.get("LastPlay", "N/A")
+        return (
+            f"Game Status: {status}\n"
+            f"{away_team} vs {home_team}\n"
+            f"Current Score: {final_score}\n"
+            f"Last Play: {last_play}\n"
+            f"Channel: {channel}\n"
+        )
+    elif status == "Scheduled":
+        return (
+            f"Game Status: {status}\n"
+            f"{away_team} vs {home_team}\n"
+            f"Start Time: {start_time}\n"
+            f"Channel: {channel}\n"
+        )
+    else:
+        return (
+            f"Game Status: {status}\n"
+            f"{away_team} vs {home_team}\n"
+            f"Details are unavailable at the moment.\n"
+        )
 
 
-data "aws_caller_identity" "current" {}
-
-# IAM Policy to Read From Parameter Store
-resource "aws_iam_policy" "ssm_policy" {
-  name        = "ssm_parameter_access"
-  description = "Allow Lambda to read NBA API Key from Parameter Store"
-
-  policy = <<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": "ssm:GetParameter",
-      "Resource": "arn:aws:ssm:us-east-1:${data.aws_caller_identity.current.account_id}:parameter/nba-api-key"
-    }
-  ]
-}
-EOF
-}
-
-# Attach IAM Policy to Read From Parameter Store to IAM Role
-resource "aws_iam_role_policy_attachment" "attach_read_param_store" {
-  role       = aws_iam_role.lambda_role.name
-  policy_arn = aws_iam_policy.ssm_policy.arn
-}
+def get_secret():
+    ssm = boto3.client("ssm", region_name="us-east-1")
+    response = ssm.get_parameter(Name="nba-api-key", WithDecryption=True)
+    return response["Parameter"]["Value"]
 
 
-# IAM Policy for CloudWatch Logs (Lambda Execution)
-resource "aws_iam_policy" "lambda_logging" {
-  name        = "lambda_logging_policy"
-  description = "Allow Lambda to write logs"
-
-  policy = <<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "logs:CreateLogGroup",
-        "logs:CreateLogStream",
-        "logs:PutLogEvents"
-      ],
-      "Resource": "arn:aws:logs:*:*:*"
-    }
-  ]
-}
-EOF
-}
-
-# Attach CloudWatch Logging Policy to IAM Role
-resource "aws_iam_role_policy_attachment" "attach_logging" {
-  role       = aws_iam_role.lambda_role.name
-  policy_arn = aws_iam_policy.lambda_logging.arn
-}
-
-# Lambda Function
-resource "aws_lambda_function" "nba_lambda" {
-  filename      = "nba_notifications.zip" # Pre-packaged ZIP
-  function_name = "nba_game_alerts"
-  role          = aws_iam_role.lambda_role.arn
-  handler       = "nba_notifications.lambda_handler"
-  runtime       = "python3.8"
-
-  environment {
-    variables = {
-      SNS_TOPIC_ARN = aws_sns_topic.nba_game_alerts.arn
-    }
-  }
-}
-
-# EventBridge Rule for Scheduling
-resource "aws_cloudwatch_event_rule" "nba_schedule" {
-  name                = "nba_game_alerts_schedule"
-  schedule_expression = "rate(2 hours)" # Adjust as needed
-}
-
-# EventBridge Target
-resource "aws_cloudwatch_event_target" "nba_target" {
-  rule      = aws_cloudwatch_event_rule.nba_schedule.name
-  target_id = "nba_lambda"
-  arn       = aws_lambda_function.nba_lambda.arn
-}
-
-# Grant EventBridge Permission to Invoke Lambda
-resource "aws_lambda_permission" "allow_eventbridge" {
-  statement_id  = "AllowExecutionFromEventBridge"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.nba_lambda.function_name
-  principal     = "events.amazonaws.com"
-  source_arn    = aws_cloudwatch_event_rule.nba_schedule.arn
-}
+def lambda_handler(event, context):
+    # Get environment variables
+    api_key = get_secret()
+    if not api_key:
+        return {"statusCode": 500, "body": "API key retrieval failed"}
+    
+    sns_topic_arn = os.getenv("SNS_TOPIC_ARN")
+    sns_client = boto3.client("sns")
+    
+    # Adjust for Central Time (UTC-6)
+    utc_now = datetime.now(timezone.utc)
+    central_time = utc_now - timedelta(hours=6)  # Central Time is UTC-6
+    today_date = central_time.strftime("%Y-%m-%d")
+    
+    print(f"Fetching games for date: {today_date}")
+    
+    # Fetch data from the API
+    api_url = f"https://api.sportsdata.io/v3/nba/scores/json/GamesByDate/{today_date}?key={api_key}"
+    print(today_date)
+     
+    try:
+        with urllib.request.urlopen(api_url) as response:
+            data = json.loads(response.read().decode())
+            print(json.dumps(data, indent=4))  # Debugging: log the raw data
+    except Exception as e:
+        print(f"Error fetching data from API: {e}")
+        return {"statusCode": 500, "body": "Error fetching data"}
+    
+    # Include all games (final, in-progress, and scheduled)
+    messages = [format_game_data(game) for game in data]
+    final_message = "\n---\n".join(messages) if messages else "No games available for today."
+    
+    # Publish to SNS
+    try:
+        sns_client.publish(
+            TopicArn=sns_topic_arn,
+            Message=final_message,
+            Subject="NBA Game Updates"
+        )
+        print("Message published to SNS successfully.")
+    except Exception as e:
+        print(f"Error publishing to SNS: {e}")
+        return {"statusCode": 500, "body": "Error publishing to SNS"}
+    
+    return {"statusCode": 200, "body": "Data processed and sent to SNS"}
